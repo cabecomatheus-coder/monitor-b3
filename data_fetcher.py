@@ -1,126 +1,69 @@
-"""
-data_fetcher.py
-----------------
-Camada de acesso a dados. TODA comunicação com o yfinance passa por aqui.
-Se no futuro o app evoluir para SaaS e trocarmos o provedor (ex: dados
-pagos via B3 Market Data, Cedro ou OpLab para opções), apenas este
-módulo precisa ser reescrito — o resto do app não muda.
-"""
-
-from datetime import datetime, timedelta
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import requests
 import yfinance as yf
 
-from config import (
-    CACHE_TTL_COTACOES,
-    CACHE_TTL_HISTORICO,
-    CACHE_TTL_OPCOES,
-    VENCIMENTO_MIN_MESES,
-    VENCIMENTO_MAX_MESES,
-)
+# Função para buscar cotações via brapi.dev (Mais estável para B3 no Streamlit Cloud)
+@st.cache_data(ttl=60)
+def get_quote_brapi(tickers):
+    tickers_str = "%2C".join(tickers)
+    url = f"https://brapi.dev/api/quote/{tickers_str}"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", [])
+            parsed_data = []
+            for item in results:
+                parsed_data.append({
+                    "Ativo": item.get("symbol"),
+                    "Preço": item.get("regularMarketPrice"),
+                    "Variação (%)": item.get("regularMarketChangePercent"),
+                    "Mínima": item.get("regularMarketDayLow"),
+                    "Máxima": item.get("regularMarketDayHigh"),
+                    "Volume": item.get("regularMarketVolume")
+                })
+            return pd.DataFrame(parsed_data)
+    except Exception as e:
+        st.warning(f"Erro ao acessar BRAPI: {e}")
+    return pd.DataFrame()
 
-
-@st.cache_data(ttl=CACHE_TTL_COTACOES, show_spinner=False)
-def get_market_snapshot(tickers: list) -> pd.DataFrame:
-    """
-    Busca a cotação atual e a variação percentual do dia para uma lista
-    de tickers. É a base do ranking de altas/baixas do dashboard.
-
-    Retorna DataFrame com colunas:
-        ticker, preco_atual, fechamento_anterior, variacao_pct, volume
-    """
-    linhas = []
-    # yf.Tickers agrupa vários papéis numa única sessão HTTP, reduzindo
-    # o número de requisições em relação a chamar yf.Ticker() em loop.
-    grupo = yf.Tickers(" ".join(tickers))
-
+# Fallback usando yfinance com headers customizados para evitar bloqueio
+@st.cache_data(ttl=60)
+def get_quote_yfinance(tickers):
+    parsed_data = []
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
     for ticker in tickers:
+        symbol = f"{ticker}.SA" if not ticker.endswith(".SA") else ticker
         try:
-            info = grupo.tickers[ticker].fast_info
-            preco_atual = info.get("last_price")
-            fechamento_anterior = info.get("previous_close")
-            volume = info.get("last_volume")
-
-            if preco_atual is None or not fechamento_anterior:
-                continue
-
-            variacao_pct = (preco_atual / fechamento_anterior - 1) * 100
-
-            linhas.append({
-                "ticker": ticker,
-                "preco_atual": round(preco_atual, 2),
-                "fechamento_anterior": round(fechamento_anterior, 2),
-                "variacao_pct": round(variacao_pct, 2),
-                "volume": volume,
-            })
+            t = yf.Ticker(symbol)
+            hist = t.history(period="2d")
+            if len(hist) >= 1:
+                last_price = hist['Close'].iloc[-1]
+                prev_price = hist['Close'].iloc[-2] if len(hist) > 1 else last_price
+                change = ((last_price - prev_price) / prev_price) * 100
+                
+                parsed_data.append({
+                    "Ativo": ticker.replace(".SA", ""),
+                    "Preço": round(last_price, 2),
+                    "Variação (%)": round(change, 2),
+                    "Mínima": round(hist['Low'].iloc[-1], 2),
+                    "Máxima": round(hist['High'].iloc[-1], 2),
+                    "Volume": int(hist['Volume'].iloc[-1])
+                })
         except Exception:
-            # Um erro pontual em um ativo não pode derrubar o dashboard inteiro.
             continue
+            
+    return pd.DataFrame(parsed_data)
 
-    return pd.DataFrame(linhas)
-
-
-@st.cache_data(ttl=CACHE_TTL_HISTORICO, show_spinner=False)
-def get_historico(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    Retorna o histórico OHLCV de um ativo. period/interval seguem a
-    sintaxe do yfinance (ex: period="1mo", interval="1d").
-    """
-    hist = yf.Ticker(ticker).history(period=period, interval=interval)
-    return hist.reset_index()
-
-
-@st.cache_data(ttl=CACHE_TTL_OPCOES, show_spinner=False)
-def get_vencimentos_validos(ticker: str) -> list:
-    """
-    Lista as datas de vencimento de opções disponíveis no yfinance para
-    o ticker, filtrando estritamente para o intervalo de 1 a 12 meses
-    a partir de hoje (requisito do produto).
-
-    LIMITAÇÃO CONHECIDA: a cobertura de opções da B3 no yfinance é
-    parcial e instável — muitos ativos não retornarão nenhuma cadeia.
-    Para uso real em produção, recomenda-se futuramente integrar uma
-    fonte de dados dedicada a derivativos B3 (ex: OpLab API, Cedro,
-    B3 Market Data) neste mesmo módulo.
-    """
-    try:
-        todas = yf.Ticker(ticker).options
-    except Exception:
-        return []
-
-    hoje = datetime.now().date()
-    limite_min = hoje + timedelta(days=30 * VENCIMENTO_MIN_MESES)
-    limite_max = hoje + timedelta(days=30 * VENCIMENTO_MAX_MESES)
-
-    validos = []
-    for data_str in todas:
-        try:
-            data_venc = datetime.strptime(data_str, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if limite_min <= data_venc <= limite_max:
-            validos.append(data_str)
-
-    return sorted(validos)
-
-
-@st.cache_data(ttl=CACHE_TTL_OPCOES, show_spinner=False)
-def get_cadeia_opcoes(ticker: str, vencimento: str) -> dict:
-    """
-    Retorna a cadeia de opções (calls e puts) de um vencimento específico.
-
-    Retorno: {"calls": DataFrame, "puts": DataFrame, "preco_ativo": float|None}
-    """
-    tk = yf.Ticker(ticker)
-    try:
-        cadeia = tk.option_chain(vencimento)
-        preco_ativo = tk.fast_info.get("last_price")
-        return {
-            "calls": cadeia.calls,
-            "puts": cadeia.puts,
-            "preco_ativo": preco_ativo,
-        }
-    except Exception:
-        return {"calls": pd.DataFrame(), "puts": pd.DataFrame(), "preco_ativo": None}
+def fetch_market_data(tickers):
+    # Tenta buscar na BRAPI primeiro
+    df = get_quote_brapi(tickers)
+    
+    # Se falhar ou vier vazio, tenta pelo yfinance
+    if df.empty:
+        df = get_quote_yfinance(tickers)
+        
+    return df
